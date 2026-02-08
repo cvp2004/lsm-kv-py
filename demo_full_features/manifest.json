@@ -1,0 +1,21 @@
+{
+  "next_sstable_id": 2,
+  "entries": [
+    {
+      "sstable_id": 0,
+      "dirname": "sstable_000000",
+      "num_entries": 5,
+      "min_key": "user_000",
+      "max_key": "user_004",
+      "level": 0
+    },
+    {
+      "sstable_id": 1,
+      "dirname": "sstable_000001",
+      "num_entries": 5,
+      "min_key": "user_005",
+      "max_key": "user_009",
+      "level": 0
+    }
+  ]
+}

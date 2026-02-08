@@ -1,0 +1,7 @@
+- improvements
+1. the worker threads should run from start itself.
+2. compaction
+3. multi-level SSTable Tree
+4. Client Server implementation
+5. UI
+6. Evaluate Codon Cimpiler for optimizing performance

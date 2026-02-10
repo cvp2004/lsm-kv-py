@@ -1,6 +1,7 @@
 """
 Data Transfer Objects for the LSM KV Store.
 """
+import json
 from dataclasses import dataclass
 from typing import Optional
 from enum import Enum
@@ -42,22 +43,30 @@ class WALRecord:
     timestamp: int
     
     def serialize(self) -> str:
-        """Serialize the WAL record to a string."""
-        return f"{self.operation.value}|{self.key}|{self.value or ''}|{self.timestamp}\n"
-    
+        """Serialize the WAL record to a JSON string."""
+        record = {
+            "op": self.operation.value,
+            "key": self.key,
+            "value": self.value,
+            "ts": self.timestamp
+        }
+        return json.dumps(record, separators=(',', ':')) + '\n'
+
     @staticmethod
     def deserialize(line: str) -> 'WALRecord':
-        """Deserialize a WAL record from a string."""
-        parts = line.strip().split('|')
-        if len(parts) != 4:
-            raise ValueError(f"Invalid WAL record format: {line}")
-        
-        operation = OperationType(parts[0])
-        key = parts[1]
-        value = parts[2] if parts[2] else None
-        timestamp = int(parts[3])
-        
-        return WALRecord(operation, key, value, timestamp)
+        """Deserialize a WAL record from a JSON string."""
+        stripped = line.strip()
+        if not stripped:
+            raise ValueError("Empty WAL record")
+
+        record = json.loads(stripped)
+
+        return WALRecord(
+            operation=OperationType(record["op"]),
+            key=record["key"],
+            value=record["value"],
+            timestamp=record["ts"]
+        )
 
 
 @dataclass

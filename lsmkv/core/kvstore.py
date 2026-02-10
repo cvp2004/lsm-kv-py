@@ -127,12 +127,18 @@ class LSMKVStore:
         """
         Insert or update a key-value pair.
 
+
         Args:
             key: The key to insert
             value: The value to insert
 
+
         Returns:
             True if successful
+
+        Raises:
+            TypeError: If key or value is not a string
+            ValueError: If key is empty or exceeds size limits
 
         Raises:
             TypeError: If key or value is not a string
@@ -164,13 +170,16 @@ class LSMKVStore:
         """
         Retrieve a value by key.
 
+
         Optimized read path:
         1. Active memtable
         2. Immutable memtable queue (newest to oldest)
         3. SSTables (newest to oldest)
 
+
         Args:
             key: The key to look up
+
 
         Returns:
             GetResult containing the value if found
@@ -206,11 +215,17 @@ class LSMKVStore:
         """
         Delete a key-value pair.
 
+
         Args:
             key: The key to delete
 
+
         Returns:
             True if successful
+
+        Raises:
+            TypeError: If key is not a string
+            ValueError: If key is empty
 
         Raises:
             TypeError: If key is not a string
@@ -317,6 +332,7 @@ class LSMKVStore:
         return time.monotonic_ns() // 1000
     
     def close(self):
+        """Clean shutdown of the store. Flushes all pending data before shutdown."""
         """Clean shutdown of the store. Flushes all pending data before shutdown."""
         print("Closing KV store...")
         self._closed = True

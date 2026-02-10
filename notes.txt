@@ -4,9 +4,7 @@
 3. multi-level SSTable Tree
 4. Client Server implementation
 5. UI
-6. Evaluate Codon Compiler for optimizing performance
-
-
+6. Evaluate Codon Cimpiler for optimizing performance
 
 [COMPLETED] Update the compaction and merge policy to trigger at 85% of actual hard limit. 
 [COMPLETED] But ensure that the background thread for flush / compact / merge doesn't block main thread while read / writes.

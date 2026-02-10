@@ -479,6 +479,9 @@ class SSTableManager:
         merged_entries.sort(key=lambda e: e.key)
 
         print(f"[SSTableManager] After merge: {len(merged_entries)} entries (bottommost={is_bottommost})")
+        merged_entries.sort(key=lambda e: e.key)
+
+        print(f"[SSTableManager] After merge: {len(merged_entries)} entries (bottommost={is_bottommost})")
         
         # Record old SSTables before creating new (crash-safe: create before delete)
         old_source = list(self.levels[level])

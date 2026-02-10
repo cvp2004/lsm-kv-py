@@ -87,6 +87,9 @@ class MemtableManager:
         # No maxlen — we handle overflow explicitly via _check_and_flush
         # to prevent silent data loss from deque auto-eviction
         self.immutable_queue = deque()
+        # No maxlen — we handle overflow explicitly via _check_and_flush
+        # to prevent silent data loss from deque auto-eviction
+        self.immutable_queue = deque()
         
         # Sequence number for ordering
         self.sequence_number = 0

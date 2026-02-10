@@ -1,14 +1,18 @@
 """
 Setup script for LSM KV Store.
 """
+import os
 from setuptools import setup, find_packages
 
-with open("README.md", "r", encoding="utf-8") as fh:
-    long_description = fh.read()
+long_description = ""
+readme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")
+if os.path.exists(readme_path):
+    with open(readme_path, "r", encoding="utf-8") as fh:
+        long_description = fh.read()
 
 setup(
     name="lsm-kv-store",
-    version="1.0.0",
+    version="1.2.0",
     author="LSM KV Store Contributors",
     description="A simple LSM tree-based key-value store implementation",
     long_description=long_description,
@@ -30,6 +34,7 @@ setup(
     python_requires=">=3.7",
     install_requires=[
         "skiplistcollections>=0.0.6",
+        "pybloomfiltermmap3>=0.5.0",
     ],
     entry_points={
         "console_scripts": [

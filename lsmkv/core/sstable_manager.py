@@ -113,8 +113,9 @@ class SSTableManager:
         self._compacting_sstable_ids: Set[int] = set()
         self._compaction_lock = threading.Lock()
         
-        # Pending manifest reload flag
+        # Pending manifest reload flag and lock (prevents TOCTOU double submission)
         self._manifest_reload_pending = threading.Event()
+        self._manifest_reload_lock = threading.Lock()
         
         # Stats
         self.total_compactions = 0
@@ -178,7 +179,13 @@ class SSTableManager:
             }
         
         sstables = self.levels[level]
-        total_size = sum(s.size_bytes() for s in sstables)
+        total_size = 0
+        for s in sstables:
+            try:
+                if s.exists():
+                    total_size += s.size_bytes()
+            except (OSError, FileNotFoundError):
+                pass  # SSTable may have been deleted by concurrent compaction
         
         # Get entries count from level manifest (more efficient than searching all entries)
         level_manifest = self.level_manifest_manager.get_level_manifest(level)
@@ -305,38 +312,38 @@ class SSTableManager:
             
             print(f"[SSTableManager] Created SSTable {metadata.dirname} at L{level} with {metadata.num_entries} entries")
             
-            # Trigger auto-compaction if enabled
-            if auto_compact:
-                self._auto_compact()
-            
-            return metadata
+            need_auto_compact = auto_compact
+        
+        # Trigger auto-compaction outside lock — snapshot reads are disk I/O
+        if need_auto_compact:
+            self._auto_compact()
+        
+        return metadata
     
     def get(self, key: str) -> Optional[Entry]:
         """
         Search SSTables for a key using level-based search.
-        
+
         Search order: L0 (newest to oldest) → L1 → L2 → ...
-        
-        Uses Bloom filters and sparse indexes for efficient lookup.
-        
+        Snapshot taken under lock; I/O performed without lock to avoid serializing reads.
+
         Args:
             key: The key to search for
-            
+
         Returns:
             Entry if found, None otherwise
         """
         with self.lock:
-            # Search level by level (L0, L1, L2, ...)
-            for level in sorted(self.levels.keys()):
-                sstables = self.levels[level]
-                
-                # Within a level, search newest to oldest (important for L0)
-                for sstable in reversed(sstables):
-                    entry = sstable.get(key)
-                    if entry:
-                        return entry
-            
-            return None
+            snapshot = {
+                level: list(sstables)
+                for level, sstables in sorted(self.levels.items())
+            }
+        for level in sorted(snapshot.keys()):
+            for sstable in reversed(snapshot[level]):
+                entry = sstable.get(key)
+                if entry:
+                    return entry
+        return None
     
     def get_all_entries(self) -> List[Entry]:
         """
@@ -437,7 +444,7 @@ class SSTableManager:
         
         # Merge all entries
         all_entries = current_entries + next_entries
-        
+
         # Deduplicate: keep entry with highest timestamp per key
         key_map = {}
         for entry in all_entries:
@@ -446,33 +453,49 @@ class SSTableManager:
             else:
                 if entry.timestamp > key_map[entry.key].timestamp:
                     key_map[entry.key] = entry
-        
-        # Remove tombstones
-        live_entries = [
-            entry for entry in key_map.values()
-            if not entry.is_deleted
-        ]
-        
-        if not live_entries:
-            print(f"[SSTableManager] No live entries after compaction (all deleted)")
-            # Clean up current and next levels
+
+        # Only drop tombstones at the bottommost level to prevent resurrection
+        is_bottommost = not any(
+            lvl > next_level and self.levels.get(lvl)
+            for lvl in self.levels
+        )
+
+        if is_bottommost:
+            merged_entries = [e for e in key_map.values() if not e.is_deleted]
+        else:
+            merged_entries = list(key_map.values())
+
+        if not merged_entries:
+            print(f"[SSTableManager] No entries after compaction (all deleted at bottommost)")
             self._delete_level_sstables(level)
             if next_level in self.levels:
                 self._delete_level_sstables(next_level)
             return None
-        
+
         # Sort by key
-        live_entries.sort(key=lambda e: e.key)
+        merged_entries.sort(key=lambda e: e.key)
+
+        print(f"[SSTableManager] After merge: {len(merged_entries)} entries (bottommost={is_bottommost})")
         
-        print(f"[SSTableManager] After merge: {len(live_entries)} unique live entries")
+        # Record old SSTables before creating new (crash-safe: create before delete)
+        old_source = list(self.levels[level])
+        old_next = list(self.levels.get(next_level, []))
         
-        # Delete old SSTables from current and next levels
-        self._delete_level_sstables(level)
-        if next_level in self.levels:
-            self._delete_level_sstables(next_level)
+        # Create new SSTable first — only after it's persisted do we delete old
+        metadata = self.add_sstable(merged_entries, level=next_level, auto_compact=False)
+        new_sstable_id = metadata.sstable_id
         
-        # Create new SSTable at next level (disable auto-compact to avoid recursion)
-        metadata = self.add_sstable(live_entries, level=next_level, auto_compact=False)
+        # Delete old SSTables (exclude new one at next_level)
+        for sstable in old_source:
+            self.levels[level] = [s for s in self.levels[level] if s.sstable_id != sstable.sstable_id]
+            self.level_manifest_manager.remove_sstables([sstable.sstable_id], level=level)
+            if sstable.exists():
+                sstable.delete()
+        for sstable in old_next:
+            self.levels[next_level] = [s for s in self.levels[next_level] if s.sstable_id != sstable.sstable_id]
+            self.level_manifest_manager.remove_sstables([sstable.sstable_id], level=next_level)
+            if sstable.exists():
+                sstable.delete()
         
         print(f"[SSTableManager] Created {metadata.dirname} at L{next_level}")
         
@@ -563,7 +586,8 @@ class SSTableManager:
         """
         Take a snapshot of SSTables for compaction.
         
-        Reads all entries while holding lock, then releases lock.
+        Copies sstable references under lock; reads entries without lock to avoid
+        blocking add_sstable/get during disk I/O.
         Returns tuple: (source_level, next_level, source_ids, next_ids, source_entries, next_entries)
         """
         with self.lock:
@@ -571,24 +595,20 @@ class SSTableManager:
                 return None
             
             next_level = level + 1
-            
-            # Snapshot source level
-            source_sstables = self.levels[level]
+            source_sstables = list(self.levels[level])
             source_ids = {s.sstable_id for s in source_sstables}
-            source_entries = []
-            for sstable in source_sstables:
-                source_entries.extend(sstable.read_all())
-            
-            # Snapshot next level if exists
-            next_ids = set()
-            next_entries = []
-            if next_level in self.levels and self.levels[next_level]:
-                next_sstables = self.levels[next_level]
-                next_ids = {s.sstable_id for s in next_sstables}
-                for sstable in next_sstables:
-                    next_entries.extend(sstable.read_all())
-            
-            return (level, next_level, source_ids, next_ids, source_entries, next_entries)
+            next_sstables = list(self.levels[next_level]) if next_level in self.levels else []
+            next_ids = {s.sstable_id for s in next_sstables}
+        
+        # Read entries outside lock — disk I/O should not block other operations
+        source_entries = []
+        for sstable in source_sstables:
+            source_entries.extend(sstable.read_all())
+        next_entries = []
+        for sstable in next_sstables:
+            next_entries.extend(sstable.read_all())
+        
+        return (level, next_level, source_ids, next_ids, source_entries, next_entries)
     
     def _background_compact(self, source_level: int, next_level: int,
                             source_ids: Set[int], next_ids: Set[int],
@@ -622,25 +642,30 @@ class SSTableManager:
                     if entry.timestamp > key_map[entry.key].timestamp:
                         key_map[entry.key] = entry
             
-            # Remove tombstones
-            live_entries = [
-                entry for entry in key_map.values()
-                if not entry.is_deleted
-            ]
-            
-            if not live_entries:
-                print(f"[Compact-Worker] No live entries after merge (all deleted)")
-                # Still need to clean up old SSTables
+            # Only drop tombstones at the bottommost level to prevent resurrection
+            with self.lock:
+                is_bottommost = not any(
+                    lvl > next_level and self.levels.get(lvl)
+                    for lvl in self.levels
+                )
+
+            if is_bottommost:
+                merged_entries = [e for e in key_map.values() if not e.is_deleted]
+            else:
+                merged_entries = list(key_map.values())
+
+            if not merged_entries:
+                print(f"[Compact-Worker] No entries after merge (all deleted at bottommost)")
                 self._finalize_compaction(source_level, next_level, source_ids, next_ids, None)
                 return
-            
+
             # Sort by key
-            live_entries.sort(key=lambda e: e.key)
-            
-            print(f"[Compact-Worker] After merge: {len(live_entries)} unique live entries")
-            
+            merged_entries.sort(key=lambda e: e.key)
+
+            print(f"[Compact-Worker] After merge: {len(merged_entries)} entries (bottommost={is_bottommost})")
+
             # Create new SSTable (this persists to disk)
-            new_sstable, new_metadata = self._create_sstable_for_compaction(live_entries, next_level)
+            new_sstable, new_metadata = self._create_sstable_for_compaction(merged_entries, next_level)
             
             # Atomically finalize: update levels, manifests, delete old
             self._finalize_compaction(source_level, next_level, source_ids, next_ids, new_sstable)
@@ -770,10 +795,12 @@ class SSTableManager:
         This ensures that after any manifest update, the manifest data
         is reloaded in the background. Old manifest data is preserved
         until the new data is ready (atomic swap).
+        Uses lock to prevent TOCTOU race on Event flag (double submission).
         """
-        if not self._manifest_reload_pending.is_set():
-            self._manifest_reload_pending.set()
-            self._manifest_reload_executor.submit(self._background_manifest_reload)
+        with self._manifest_reload_lock:
+            if not self._manifest_reload_pending.is_set():
+                self._manifest_reload_pending.set()
+                self._manifest_reload_executor.submit(self._background_manifest_reload)
     
     def _background_manifest_reload(self):
         """
@@ -877,12 +904,25 @@ class SSTableManager:
             
             print(f"[SSTableManager] After deduplication: {len(compacted_entries)} unique live entries")
             
-            # Delete all old SSTables from all levels
-            for level in list(self.levels.keys()):
-                self._delete_level_sstables(level)
+            # Record old SSTables before creating new one (crash-safe: create before delete)
+            old_sstables_by_level = {
+                level: list(sstables)
+                for level, sstables in self.levels.items()
+            }
             
-            # Create new compacted SSTable at target level (disable auto-compact)
+            # Create new compacted SSTable first — only after it's persisted do we delete old
             metadata = self.add_sstable(compacted_entries, level=target_level, auto_compact=False)
+            new_sstable_id = metadata.sstable_id
+            
+            # Delete old SSTables (keep the new one at target_level)
+            for level, sstables in old_sstables_by_level.items():
+                old_ids = [s.sstable_id for s in sstables]
+                self.levels[level] = [s for s in self.levels[level] if s.sstable_id not in old_ids]
+                if old_ids:
+                    self.level_manifest_manager.remove_sstables(old_ids, level=level)
+                for sstable in sstables:
+                    if sstable.exists():
+                        sstable.delete()
             
             print(f"[SSTableManager] Full compaction complete: {metadata.dirname} at L{target_level}")
             

@@ -104,6 +104,7 @@ class SSTable:
         self._sparse_index: Optional[SparseIndex] = None
         self._mmap = None
         self._file = None
+        self._read_lock = threading.Lock()
     
     def write(self, entries: List[Entry], block_size: int = 4) -> SSTableMetadata:
         """
@@ -195,6 +196,7 @@ class SSTable:
     def read_all(self) -> List[Entry]:
         """
         Read all entries from the SSTable using mmap.
+        Thread-safe: seek/read are not atomic; lock protects shared mmap.
         
         Returns:
             List of entries
@@ -209,9 +211,10 @@ class SSTable:
         if self._mmap is None:
             return entries
         
-        # Read using mmap
-        self._mmap.seek(0)
-        content = self._mmap.read().decode('utf-8')
+        # Read using mmap — lock protects shared mmap from concurrent seek/read
+        with self._read_lock:
+            self._mmap.seek(0)
+            content = self._mmap.read().decode('utf-8')
         
         for line in content.split('\n'):
             line = line.strip()
@@ -421,8 +424,9 @@ class LazySSTable:
         # Lock for thread-safe lazy loading
         self._load_lock = threading.Lock()
         
-        # Track if we've been accessed
+        # Track if we've been accessed (atomic increment via lock)
         self._access_count = 0
+        self._access_lock = threading.Lock()
         self._loaded = False
     
     @property
@@ -477,7 +481,8 @@ class LazySSTable:
         Returns:
             Entry if found, None otherwise
         """
-        self._access_count += 1
+        with self._access_lock:
+            self._access_count += 1
         
         # Quick key range check using metadata (no disk I/O)
         if self._metadata:
@@ -492,7 +497,8 @@ class LazySSTable:
     
     def read_all(self) -> List[Entry]:
         """Read all entries (loads SSTable on demand)."""
-        self._access_count += 1
+        with self._access_lock:
+            self._access_count += 1
         
         sstable = self._ensure_loaded()
         if sstable is None:

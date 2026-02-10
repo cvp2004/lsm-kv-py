@@ -84,7 +84,9 @@ class MemtableManager:
         self.active = Memtable(max_size=memtable_size)
         
         # Queue of immutable memtables (oldest to newest)
-        self.immutable_queue = deque(maxlen=max_immutable)
+        # No maxlen — we handle overflow explicitly via _check_and_flush
+        # to prevent silent data loss from deque auto-eviction
+        self.immutable_queue = deque()
         
         # Sequence number for ordering
         self.sequence_number = 0
@@ -111,10 +113,12 @@ class MemtableManager:
         """
         with self.lock:
             self.active.put(entry)
-            
-            # Check if rotation needed
             if self.active.is_full():
-                self._rotate_memtable()
+                to_flush_sync = self._rotate_memtable()
+            else:
+                to_flush_sync = None
+        if to_flush_sync is not None:
+            self._async_flush(to_flush_sync)
     
     def get(self, key: str) -> Optional[Entry]:
         """
@@ -155,15 +159,19 @@ class MemtableManager:
         """
         with self.lock:
             self.active.delete(entry)
-            
-            # Check if rotation needed
             if self.active.is_full():
-                self._rotate_memtable()
+                to_flush_sync = self._rotate_memtable()
+            else:
+                to_flush_sync = None
+        if to_flush_sync is not None:
+            self._async_flush(to_flush_sync)
     
-    def _rotate_memtable(self):
+    def _rotate_memtable(self) -> Optional[ImmutableMemtable]:
         """
         Rotate active memtable to immutable queue and create new active.
         Triggers flush if queue is full or memory limit exceeded.
+        Returns immutable to flush synchronously if queue severely backed up, else None.
+        Caller must flush outside lock.
         """
         # Move active to immutable
         immutable = ImmutableMemtable(
@@ -181,33 +189,46 @@ class MemtableManager:
         
         print(f"[MemtableManager] Rotated to immutable queue (size={len(self.immutable_queue)})")
         
-        # Check if we need to flush
-        self._check_and_flush()
+        return self._check_and_flush()
     
-    def _check_and_flush(self):
-        """Check if flushing is needed and trigger if necessary."""
+    def _check_and_flush(self) -> Optional[ImmutableMemtable]:
+        """
+        Check if flushing is needed. Pops one item if so.
+        Returns the immutable to flush synchronously if queue severely backed up,
+        else None (and submits to executor). Caller must NOT hold lock when doing sync flush.
+        """
         should_flush = False
         reason = ""
-        
+
         # Reason 1: Queue size limit
         if len(self.immutable_queue) >= self.max_immutable:
             should_flush = True
             reason = f"queue full ({len(self.immutable_queue)} >= {self.max_immutable})"
-        
+
         # Reason 2: Memory limit
         total_memory = sum(im.size_bytes for im in self.immutable_queue)
         if total_memory >= self.max_memory_bytes:
             should_flush = True
             reason = f"memory limit ({total_memory} >= {self.max_memory_bytes} bytes)"
-        
-        if should_flush:
-            # Flush oldest memtable (priority flushing)
-            oldest = self.immutable_queue.popleft()
+
+        if not should_flush:
+            return None
+
+        oldest = self.immutable_queue.popleft()
+        # Sync flush when at or above max to bound queue growth (prevents unbounded 1x-2x range)
+        queue_at_limit = len(self.immutable_queue) >= self.max_immutable
+
+        if queue_at_limit:
+            print(f"[MemtableManager] Queue at limit, flushing synchronously ({reason})")
+        else:
             print(f"[MemtableManager] Flushing oldest memtable ({reason})")
-            
-            # Submit to thread pool
-            future = self.flush_executor.submit(self._async_flush, oldest)
-            self.total_flushes += 1
+
+        self.total_flushes += 1
+
+        if queue_at_limit:
+            return oldest
+        self.flush_executor.submit(self._async_flush, oldest)
+        return None
     
     def _async_flush(self, immutable: ImmutableMemtable):
         """
@@ -232,23 +253,68 @@ class MemtableManager:
             import traceback
             traceback.print_exc()
     
+    def flush_active_sync(self) -> Optional['ImmutableMemtable']:
+        """
+        Atomically rotate the active memtable and return it as ImmutableMemtable.
+        The rotated memtable is added to immutable_queue so it remains visible
+        during read path until the caller removes it after flush completes.
+        Does NOT trigger the async flush callback — the caller handles flushing.
+
+        Returns:
+            ImmutableMemtable wrapping the rotated memtable, or None if active is empty.
+        """
+        with self.lock:
+            if len(self.active) == 0:
+                return None
+
+            old_active = self.active
+            self.active = Memtable(max_size=self.memtable_size)
+            self.total_rotations += 1
+            immutable = ImmutableMemtable(
+                memtable=old_active,
+                sequence_number=self.sequence_number
+            )
+            self.sequence_number += 1
+            self.immutable_queue.append(immutable)
+            return immutable
+
+    def remove_flushed_immutable(self, immutable: 'ImmutableMemtable'):
+        """
+        Remove an immutable memtable from the queue after it has been flushed.
+        Call this after SSTable write and WAL clear.
+
+        Args:
+            immutable: The ImmutableMemtable that was flushed
+        """
+        with self.lock:
+            try:
+                self.immutable_queue.remove(immutable)
+            except ValueError:
+                pass  # Already removed (e.g. by force_flush_all)
+
     def force_flush_all(self):
         """
         Force flush all immutable memtables synchronously.
         Useful before shutdown or manual flush.
+        Releases lock during I/O to avoid blocking put/get/delete.
         """
-        with self.lock:
-            # Flush all immutable memtables
-            while self.immutable_queue:
-                immutable = self.immutable_queue.popleft()
-                if self.on_flush_callback:
-                    self.on_flush_callback(immutable.memtable)
-            
-            # Flush active memtable if not empty
-            if len(self.active) > 0:
-                if self.on_flush_callback:
-                    self.on_flush_callback(self.active)
-                self.active.clear()
+        while True:
+            to_flush = None
+            with self.lock:
+                if self.immutable_queue:
+                    to_flush = self.immutable_queue.popleft()
+                elif len(self.active) > 0:
+                    to_flush = ImmutableMemtable(
+                        memtable=self.active,
+                        sequence_number=self.sequence_number
+                    )
+                    self.sequence_number += 1
+                    self.active = Memtable(max_size=self.memtable_size)
+                    self.total_rotations += 1
+                else:
+                    break
+            if to_flush and self.on_flush_callback:
+                self.on_flush_callback(to_flush.memtable)
     
     def close(self):
         """Shutdown the manager and wait for pending flushes."""

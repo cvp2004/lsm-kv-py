@@ -380,9 +380,13 @@ class TestSSTableManager:
         print("\nTest 12: Level Information")
         print("-" * 60)
         
+        # Use isolated subdir — previous tests leave residual sstables in test_dir
+        level_info_dir = os.path.join(self.test_dir, "level_info_test")
+        os.makedirs(level_info_dir, exist_ok=True)
+        
         manager = SSTableManager(
-            os.path.join(self.test_dir, "sstables"),
-            os.path.join(self.test_dir, "manifest.json"),
+            os.path.join(level_info_dir, "sstables"),
+            os.path.join(level_info_dir, "manifest.json"),
             level_ratio=10,
             base_level_entries=10,
             max_l0_sstables=10

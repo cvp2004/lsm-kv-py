@@ -2,6 +2,7 @@
 Main LSM-based Key-Value Store implementation with MemtableManager and SSTableManager.
 """
 import os
+import threading
 import time
 from typing import Optional, List
 from lsmkv.storage.memtable import Memtable
@@ -71,6 +72,13 @@ class LSMKVStore:
             on_flush_callback=self._flush_memtable_to_sstable
         )
         
+        # Write lock: ensures WAL and memtable ordering stay consistent.
+        # Without this, concurrent put() can have different order in WAL vs memtable.
+        self._write_lock = threading.Lock()
+
+        # Shutdown flag: rejects new writes during/after close()
+        self._closed = False
+
         # Load existing data
         self.sstable_manager.load_from_manifest()
         self._recover_from_wal()
@@ -96,54 +104,84 @@ class LSMKVStore:
         
         print(f"Recovered {len(records)} records from WAL")
     
+    MAX_KEY_SIZE = 1024        # 1 KB
+    MAX_VALUE_SIZE = 1048576   # 1 MB
+
+    def _validate_key(self, key: str):
+        """Validate key type and size."""
+        if not isinstance(key, str):
+            raise TypeError(f"Key must be a string, got {type(key).__name__}")
+        if not key:
+            raise ValueError("Key cannot be empty")
+        if len(key) > self.MAX_KEY_SIZE:
+            raise ValueError(f"Key exceeds max size ({len(key)} > {self.MAX_KEY_SIZE} bytes)")
+
+    def _validate_value(self, value: str):
+        """Validate value type and size."""
+        if not isinstance(value, str):
+            raise TypeError(f"Value must be a string, got {type(value).__name__}")
+        if len(value) > self.MAX_VALUE_SIZE:
+            raise ValueError(f"Value exceeds max size ({len(value)} > {self.MAX_VALUE_SIZE} bytes)")
+
     def put(self, key: str, value: str) -> bool:
         """
         Insert or update a key-value pair.
-        
+
         Args:
             key: The key to insert
             value: The value to insert
-            
+
         Returns:
             True if successful
+
+        Raises:
+            TypeError: If key or value is not a string
+            ValueError: If key is empty or exceeds size limits
         """
-        timestamp = self._get_timestamp()
-        
-        # Write to WAL first for durability
-        wal_record = WALRecord(
-            operation=OperationType.PUT,
-            key=key,
-            value=value,
-            timestamp=timestamp
-        )
-        self.wal.append(wal_record)
-        
-        # Update via MemtableManager
-        entry = Entry(
-            key=key,
-            value=value,
-            timestamp=timestamp,
-            is_deleted=False
-        )
-        self.memtable_manager.put(entry)
-        
+        self._validate_key(key)
+        self._validate_value(value)
+        if self._closed:
+            raise RuntimeError("KV store is closed")
+        with self._write_lock:
+            timestamp = self._get_timestamp()
+            wal_record = WALRecord(
+                operation=OperationType.PUT,
+                key=key,
+                value=value,
+                timestamp=timestamp
+            )
+            self.wal.append(wal_record)
+            entry = Entry(
+                key=key,
+                value=value,
+                timestamp=timestamp,
+                is_deleted=False
+            )
+            self.memtable_manager.put(entry)
         return True
     
     def get(self, key: str) -> GetResult:
         """
         Retrieve a value by key.
-        
+
         Optimized read path:
         1. Active memtable
         2. Immutable memtable queue (newest to oldest)
         3. SSTables (newest to oldest)
-        
+
         Args:
             key: The key to look up
-            
+
         Returns:
             GetResult containing the value if found
+
+        Raises:
+            TypeError: If key is not a string
+            ValueError: If key is empty
         """
+        self._validate_key(key)
+        if self._closed:
+            raise RuntimeError("KV store is closed")
         # 1. Check memtable manager (active + immutable queue)
         # NOTE: MemtableManager now returns tombstones to stop search propagation
         entry = self.memtable_manager.get(key)
@@ -167,33 +205,36 @@ class LSMKVStore:
     def delete(self, key: str) -> bool:
         """
         Delete a key-value pair.
-        
+
         Args:
             key: The key to delete
-            
+
         Returns:
             True if successful
+
+        Raises:
+            TypeError: If key is not a string
+            ValueError: If key is empty
         """
-        timestamp = self._get_timestamp()
-        
-        # Write to WAL first
-        wal_record = WALRecord(
-            operation=OperationType.DELETE,
-            key=key,
-            value=None,
-            timestamp=timestamp
-        )
-        self.wal.append(wal_record)
-        
-        # Update via MemtableManager
-        entry = Entry(
-            key=key,
-            value=None,
-            timestamp=timestamp,
-            is_deleted=True
-        )
-        self.memtable_manager.delete(entry)
-        
+        self._validate_key(key)
+        if self._closed:
+            raise RuntimeError("KV store is closed")
+        with self._write_lock:
+            timestamp = self._get_timestamp()
+            wal_record = WALRecord(
+                operation=OperationType.DELETE,
+                key=key,
+                value=None,
+                timestamp=timestamp
+            )
+            self.wal.append(wal_record)
+            entry = Entry(
+                key=key,
+                value=None,
+                timestamp=timestamp,
+                is_deleted=True
+            )
+            self.memtable_manager.delete(entry)
         return True
     
     def _flush_memtable_to_sstable(self, memtable: Memtable):
@@ -220,54 +261,42 @@ class LSMKVStore:
     def _clear_wal_for_flushed_data(self, flushed_entries: List[Entry]):
         """
         Clear WAL entries for flushed data.
-        
+        Uses WAL.replace_with_filtered for atomic read-filter-replace under single lock.
+        Prevents race where concurrent put() appends are lost.
+
         Args:
             flushed_entries: Entries that were flushed
         """
-        # Read current WAL
-        current_records = self.wal.read_all()
-        
-        # Create set of flushed keys for quick lookup
-        flushed_keys = {entry.key for entry in flushed_entries}
-        
-        # Keep only records not in flushed set (newer writes)
-        records_to_keep = []
-        for record in current_records:
-            # Keep if key not in flushed set (newer write)
-            # This is a simplification - proper implementation would use timestamps
-            if record.key not in flushed_keys or record.timestamp > max(e.timestamp for e in flushed_entries if e.key == record.key):
-                records_to_keep.append(record)
-        
-        # Rewrite WAL with remaining records
-        self.wal.clear()
-        for record in records_to_keep:
-            self.wal.append(record)
+        flushed_ts = {}
+        for entry in flushed_entries:
+            if entry.key not in flushed_ts or entry.timestamp > flushed_ts[entry.key]:
+                flushed_ts[entry.key] = entry.timestamp
+
+        def keep_record(r):
+            return r.key not in flushed_ts or r.timestamp > flushed_ts[r.key]
+
+        self.wal.replace_with_filtered(keep_record)
     
     def flush(self) -> SSTableMetadata:
         """
         Manually flush active memtable to SSTable.
-        
+        Thread-safe: atomically rotates active memtable, keeps it in read path
+        until flush completes (no visibility gap).
+
         Returns:
             Metadata about the created SSTable
         """
-        # Check if memtable is empty
-        active_size = len(self.memtable_manager.active)
-        if active_size == 0:
+        immutable = self.memtable_manager.flush_active_sync()
+        if immutable is None:
             raise ValueError("Cannot flush empty memtable")
-        
-        # Get entries from active memtable
-        entries = self.memtable_manager.active.get_all_entries()
-        
-        # Delegate SSTable creation to SSTableManager
-        metadata = self.sstable_manager.add_sstable(entries)
-        
-        # Clear active memtable
-        self.memtable_manager.active.clear()
-        
-        # Clear WAL
-        self.wal.clear()
-        
-        return metadata
+
+        try:
+            entries = immutable.get_all_entries()
+            metadata = self.sstable_manager.add_sstable(entries)
+            self._clear_wal_for_flushed_data(entries)
+            return metadata
+        finally:
+            self.memtable_manager.remove_flushed_immutable(immutable)
     
     def compact(self) -> SSTableMetadata:
         """
@@ -277,26 +306,37 @@ class LSMKVStore:
         Returns:
             Metadata about the compacted SSTable
         """
-        # Delegate to SSTableManager
+        # Wait for any in-flight background compactions first, to avoid race
+        self.sstable_manager.wait_for_compaction(timeout=30.0)
         return self.sstable_manager.compact()
     
     def _get_timestamp(self) -> int:
-        """Get current timestamp in microseconds."""
-        return int(time.time() * 1000000)
+        """Get monotonically increasing timestamp in microseconds.
+        Uses time.monotonic_ns() to avoid NTP/clock-going-backward issues.
+        """
+        return time.monotonic_ns() // 1000
     
     def close(self):
-        """Clean shutdown of the store."""
+        """Clean shutdown of the store. Flushes all pending data before shutdown."""
         print("Closing KV store...")
-        
-        # Shutdown memtable manager (waits for pending flushes)
+        self._closed = True
+
+        # 1. Flush all in-memory data (active + immutable queue) to SSTables
+        self.memtable_manager.force_flush_all()
+
+        # 2. Shutdown memtable manager FIRST — wait for all async flush workers.
+        #    They may call _clear_wal_for_flushed_data; WAL must not be cleared yet.
         self.memtable_manager.close()
-        
-        # Shutdown SSTableManager (waits for pending compactions)
+
+        # 3. NOW clear WAL — all flush workers are done, safe to clear
+        self.wal.clear()
+
+        # 4. Shutdown SSTableManager (waits for pending compactions)
         self.sstable_manager.shutdown(wait=True, timeout=30.0)
-        
-        # Close all SSTables (cleanup mmap) via SSTableManager
+
+        # 5. Close all SSTables (cleanup mmap) via SSTableManager
         self.sstable_manager.close()
-        
+
         print("KV store closed.")
     
     def stats(self) -> dict:
@@ -342,3 +382,4 @@ class LSMKVStore:
             Dictionary mapping level to detailed stats
         """
         return self.sstable_manager.get_level_info()
+

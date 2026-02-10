@@ -33,20 +33,23 @@ class Memtable:
         self.skiplist[entry.key] = entry
         self.key_map[entry.key] = entry
     
-    def get(self, key: str) -> Optional[Entry]:
+    def get(self, key: str, include_tombstones: bool = False) -> Optional[Entry]:
         """
         Get an entry from the memtable.
         
         Args:
             key: The key to look up
+            include_tombstones: If True, return tombstone entries (for stopping search)
             
         Returns:
-            The entry if found and not deleted, None otherwise
+            The entry if found (including tombstones if include_tombstones=True),
+            None otherwise
         """
         # O(1) lookup using dictionary
         entry = self.key_map.get(key)
-        if entry and not entry.is_deleted:
-            return entry
+        if entry:
+            if include_tombstones or not entry.is_deleted:
+                return entry
         return None
     
     def delete(self, entry: Entry):

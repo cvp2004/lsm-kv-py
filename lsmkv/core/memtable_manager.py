@@ -31,9 +31,9 @@ class ImmutableMemtable:
         # Rough estimate: 100 bytes per entry (key + value + overhead)
         return len(self.memtable) * 100
     
-    def get(self, key: str) -> Optional[Entry]:
+    def get(self, key: str, include_tombstones: bool = False) -> Optional[Entry]:
         """Get entry from immutable memtable."""
-        return self.memtable.get(key)
+        return self.memtable.get(key, include_tombstones=include_tombstones)
     
     def get_all_entries(self) -> List[Entry]:
         """Get all entries in sorted order."""
@@ -121,21 +121,25 @@ class MemtableManager:
         Get an entry by key.
         Search order: active → immutable queue (newest to oldest).
         
+        IMPORTANT: Returns tombstone entries to stop search propagation.
+        The caller (LSMKVStore) must check is_deleted flag.
+        
         Args:
             key: The key to look up
             
         Returns:
-            Entry if found, None otherwise
+            Entry if found (including tombstones), None otherwise
         """
         with self.lock:
             # 1. Check active memtable first (most recent data)
-            entry = self.active.get(key)
+            # Include tombstones to stop search at delete markers
+            entry = self.active.get(key, include_tombstones=True)
             if entry:
                 return entry
             
             # 2. Check immutable queue (newest to oldest)
             for immutable in reversed(self.immutable_queue):
-                entry = immutable.get(key)
+                entry = immutable.get(key, include_tombstones=True)
                 if entry:
                     return entry
             

@@ -22,10 +22,12 @@ class LSMKVStore:
         max_immutable_memtables: int = 4,
         max_memory_mb: int = 10,
         flush_workers: int = 2,
+        # Compaction settings
         level_ratio: int = 10,
         base_level_size_mb: float = 1.0,
         base_level_entries: int = 1000,
-        max_l0_sstables: int = 4
+        max_l0_sstables: int = 4,
+        soft_limit_ratio: float = 0.85
     ):
         """
         Initialize the KV store with leveled compaction.
@@ -35,11 +37,12 @@ class LSMKVStore:
             memtable_size: Maximum entries per memtable
             max_immutable_memtables: Max immutable memtables in queue
             max_memory_mb: Max memory for immutable queue (MB)
-            flush_workers: Number of concurrent flush workers
+            flush_workers: Number of flush worker threads
             level_ratio: Size multiplier between levels (default: 10)
             base_level_size_mb: L0 max size in MB (default: 1.0)
             base_level_entries: L0 max entries (default: 1000)
             max_l0_sstables: Max SSTables in L0 before compaction (default: 4)
+            soft_limit_ratio: Trigger compaction at % of hard limit (default: 0.85 = 85%)
         """
         self.data_dir = data_dir
         self.sstables_dir = os.path.join(data_dir, "sstables")
@@ -55,10 +58,11 @@ class LSMKVStore:
             level_ratio=level_ratio,
             base_level_size_mb=base_level_size_mb,
             base_level_entries=base_level_entries,
-            max_l0_sstables=max_l0_sstables
+            max_l0_sstables=max_l0_sstables,
+            soft_limit_ratio=soft_limit_ratio
         )
         
-        # Initialize MemtableManager
+        # Initialize MemtableManager with thread pool
         self.memtable_manager = MemtableManager(
             memtable_size=memtable_size,
             max_immutable=max_immutable_memtables,
@@ -141,9 +145,13 @@ class LSMKVStore:
             GetResult containing the value if found
         """
         # 1. Check memtable manager (active + immutable queue)
+        # NOTE: MemtableManager now returns tombstones to stop search propagation
         entry = self.memtable_manager.get(key)
         
         if entry:
+            # Check if it's a tombstone (delete marker)
+            if entry.is_deleted:
+                return GetResult(key=key, value=None, found=False)
             return GetResult(key=key, value=entry.value, found=True)
         
         # 2. Check SSTables (newest to oldest) via SSTableManager
@@ -280,14 +288,16 @@ class LSMKVStore:
         """Clean shutdown of the store."""
         print("Closing KV store...")
         
-        # Shutdown memtable manager
+        # Shutdown memtable manager (waits for pending flushes)
         self.memtable_manager.close()
+        
+        # Shutdown SSTableManager (waits for pending compactions)
+        self.sstable_manager.shutdown(wait=True, timeout=30.0)
         
         # Close all SSTables (cleanup mmap) via SSTableManager
         self.sstable_manager.close()
         
-        # Wait a bit for any pending flushes
-        time.sleep(0.2)
+        print("KV store closed.")
     
     def stats(self) -> dict:
         """

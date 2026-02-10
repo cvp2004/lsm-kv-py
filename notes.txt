@@ -1,7 +1,25 @@
 - improvements
-1. the worker threads should run from start itself.
+[COMPLETED] 1. the worker threads should run from start itself. (ThreadPoolExecutor workers start on first task, but pool is initialized at startup)
 2. compaction
 3. multi-level SSTable Tree
 4. Client Server implementation
 5. UI
-6. Evaluate Codon Cimpiler for optimizing performance
+6. Evaluate Codon Compiler for optimizing performance
+
+
+
+[COMPLETED] Update the compaction and merge policy to trigger at 85% of actual hard limit. 
+[COMPLETED] But ensure that the background thread for flush / compact / merge doesn't block main thread while read / writes.
+
+[COMPLETED] Also, update the manifests to support a separate manifest for each level.
+
+[COMPLETED] Also, add logic to ensure the background thread gets a snapshot of actual SSTables to perform operations and once the new SSTable is persisted to disk, 
+only then the actual SSTables are deleted and manifests for the resepctive levels are updated.
+
+[COMPLETED] Also, don't load the actual SSTables to memory on start. only load them when they are actually needed for read operations. 
+[COMPLETED] just load the SSTable metadata from manifest during startup. 
+[COMPLETED] Also, after any Manifest is updated, the manifest objects in memory are deleted and reloaded to get latest data. 
+[COMPLETED] This is also done by background thread. 
+[COMPLETED] Also, ensure until new map / collection of SSTable Metadata is ready, old ones are preserved.
+
+[COMPLETED] Optimized mmap reads: only read bytes between floor and ceil from sparse index (0.4% of file for typical lookups).

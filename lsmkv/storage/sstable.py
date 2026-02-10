@@ -1,11 +1,18 @@
 """
 SSTable (Sorted String Table) implementation for persistent storage.
 Enhanced with Bloom filter, sparse index, and mmap I/O.
+
+Features:
+- Lazy loading: Only metadata is loaded on startup, actual SSTable loaded on demand
+- Bloom filter for fast negative lookups
+- Sparse index for efficient range scans using floor/ceil bounds
+- mmap for I/O performance with targeted reads
 """
 import os
 import json
 import mmap
-from typing import List, Optional
+import threading
+from typing import List, Optional, TYPE_CHECKING
 from lsmkv.core.dto import Entry
 from lsmkv.storage.bloom_filter import BloomFilter
 from lsmkv.storage.sparse_index import SparseIndex
@@ -223,7 +230,12 @@ class SSTable:
     def get(self, key: str) -> Optional[Entry]:
         """
         Get an entry by key from the SSTable.
-        Uses Bloom filter for fast negative lookups and sparse index for efficient scanning.
+        
+        Uses optimized read strategy:
+        1. Bloom filter for fast negative lookup (O(k) where k = hash functions)
+        2. Sparse index to get floor/ceil byte offsets (O(log n))
+        3. mmap to read ONLY the bytes between floor and ceil offsets
+        4. Binary-like scan within the bounded region
         
         Args:
             key: The key to look up
@@ -247,55 +259,79 @@ class SSTable:
         if self._mmap is None:
             return None
         
-        # Get scan range from sparse index
+        # Get scan range from sparse index (floor and ceil bounds)
         start_offset = 0
         end_offset = None
         
         if self._sparse_index:
             start_offset, end_offset = self._sparse_index.get_scan_range(key)
         
-        # Scan the relevant section using mmap
-        self._mmap.seek(start_offset)
+        # OPTIMIZED: Read only the bounded region using mmap
+        # This avoids reading the entire file
+        return self._read_bounded_region(key, start_offset, end_offset)
+    
+    def _read_bounded_region(self, key: str, start_offset: int, 
+                             end_offset: Optional[int]) -> Optional[Entry]:
+        """
+        Read only the bytes between floor and ceil offsets from sparse index.
         
-        # Read line by line from start_offset
-        current_pos = start_offset
+        This is the key optimization: instead of reading the entire file,
+        we only mmap-read the specific byte range where the key could exist.
         
-        while True:
-            # Check if we've reached the end offset
-            if end_offset is not None and current_pos >= end_offset:
-                break
+        Args:
+            key: The key to search for
+            start_offset: Floor offset from sparse index (largest key <= target)
+            end_offset: Ceil offset from sparse index (smallest key > target), or None for EOF
             
-            # Read until newline
-            line_bytes = b''
-            while current_pos < len(self._mmap):
-                byte = self._mmap[current_pos:current_pos+1]
-                current_pos += 1
-                
-                if byte == b'\n':
-                    break
-                line_bytes += byte
-            
-            if not line_bytes:
-                break
+        Returns:
+            Entry if found, None otherwise
+        """
+        if self._mmap is None:
+            return None
+        
+        mmap_len = len(self._mmap)
+        
+        # Clamp end_offset to mmap length
+        if end_offset is None or end_offset > mmap_len:
+            end_offset = mmap_len
+        
+        # Validate offsets
+        if start_offset >= mmap_len or start_offset >= end_offset:
+            return None
+        
+        # Read ONLY the bounded region
+        # This is efficient because mmap only loads pages on demand
+        bounded_bytes = self._mmap[start_offset:end_offset]
+        
+        # Parse entries within the bounded region
+        try:
+            bounded_content = bounded_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            return None
+        
+        for line in bounded_content.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
             
             try:
-                line = line_bytes.decode('utf-8').strip()
-                if line:
-                    entry_dict = json.loads(line)
+                entry_dict = json.loads(line)
+                entry_key = entry_dict["key"]
+                
+                # Check if this is the key we're looking for
+                if entry_key == key:
+                    return Entry(
+                        key=entry_dict["key"],
+                        value=entry_dict["value"],
+                        timestamp=entry_dict["timestamp"],
+                        is_deleted=entry_dict["is_deleted"]
+                    )
+                
+                # Since entries are sorted, if we've passed the key, it's not here
+                if entry_key > key:
+                    break
                     
-                    # Check if this is the key we're looking for
-                    if entry_dict["key"] == key:
-                        return Entry(
-                            key=entry_dict["key"],
-                            value=entry_dict["value"],
-                            timestamp=entry_dict["timestamp"],
-                            is_deleted=entry_dict["is_deleted"]
-                        )
-                    
-                    # Since entries are sorted, if we've passed the key, it's not here
-                    if entry_dict["key"] > key:
-                        break
-            except (json.JSONDecodeError, UnicodeDecodeError):
+            except (json.JSONDecodeError, KeyError):
                 continue
         
         return None
@@ -339,3 +375,183 @@ class SSTable:
         if os.path.exists(self.base_dir):
             import shutil
             shutil.rmtree(self.base_dir)
+
+
+class LazySSTable:
+    """
+    Lazy-loading wrapper for SSTable.
+    
+    Only stores metadata on initialization. The actual SSTable object
+    (with mmap, bloom filter, sparse index) is loaded on demand when
+    first accessed for read operations.
+    
+    Benefits:
+    - Fast startup: Only reads manifest metadata, not all SSTable files
+    - Memory efficient: SSTables loaded only when needed
+    - Supports caching: Frequently accessed SSTables stay in memory
+    
+    Usage:
+        lazy = LazySSTable(sstables_dir, metadata)
+        # SSTable not loaded yet
+        
+        entry = lazy.get("key")  # SSTable loaded here on first access
+        # SSTable now cached in memory
+    """
+    
+    def __init__(self, sstables_dir: str, sstable_id: int,
+                 metadata: Optional[SSTableMetadata] = None):
+        """
+        Initialize lazy SSTable wrapper.
+        
+        Args:
+            sstables_dir: Base directory for SSTables
+            sstable_id: Unique ID for this SSTable
+            metadata: Pre-loaded metadata (optional, avoids disk read)
+        """
+        self.sstables_dir = sstables_dir
+        self.sstable_id = sstable_id
+        self.dirname = f"sstable_{sstable_id:06d}"
+        
+        # Store metadata (loaded from manifest, no disk I/O needed)
+        self._metadata = metadata
+        
+        # Actual SSTable object (loaded on demand)
+        self._sstable: Optional[SSTable] = None
+        
+        # Lock for thread-safe lazy loading
+        self._load_lock = threading.Lock()
+        
+        # Track if we've been accessed
+        self._access_count = 0
+        self._loaded = False
+    
+    @property
+    def metadata(self) -> Optional[SSTableMetadata]:
+        """Get metadata (no disk I/O)."""
+        return self._metadata
+    
+    @metadata.setter
+    def metadata(self, value: SSTableMetadata):
+        """Set metadata."""
+        self._metadata = value
+    
+    def _ensure_loaded(self) -> Optional[SSTable]:
+        """
+        Lazy load the actual SSTable.
+        
+        Thread-safe: Uses double-checked locking pattern.
+        
+        Returns:
+            The loaded SSTable, or None if it doesn't exist
+        """
+        if self._sstable is not None:
+            return self._sstable
+        
+        with self._load_lock:
+            # Double-check after acquiring lock
+            if self._sstable is not None:
+                return self._sstable
+            
+            # Create and load the actual SSTable
+            sstable = SSTable(self.sstables_dir, self.sstable_id)
+            
+            if not sstable.exists():
+                return None
+            
+            # Copy metadata if we have it
+            if self._metadata:
+                sstable.metadata = self._metadata
+            
+            self._sstable = sstable
+            self._loaded = True
+            
+            return self._sstable
+    
+    def get(self, key: str) -> Optional[Entry]:
+        """
+        Get an entry by key (loads SSTable on demand).
+        
+        Args:
+            key: The key to look up
+            
+        Returns:
+            Entry if found, None otherwise
+        """
+        self._access_count += 1
+        
+        # Quick key range check using metadata (no disk I/O)
+        if self._metadata:
+            if key < self._metadata.min_key or key > self._metadata.max_key:
+                return None
+        
+        sstable = self._ensure_loaded()
+        if sstable is None:
+            return None
+        
+        return sstable.get(key)
+    
+    def read_all(self) -> List[Entry]:
+        """Read all entries (loads SSTable on demand)."""
+        self._access_count += 1
+        
+        sstable = self._ensure_loaded()
+        if sstable is None:
+            return []
+        
+        return sstable.read_all()
+    
+    def exists(self) -> bool:
+        """Check if SSTable exists on disk."""
+        base_dir = os.path.join(self.sstables_dir, self.dirname)
+        data_filepath = os.path.join(base_dir, SSTable.DATA_FILE)
+        return os.path.exists(base_dir) and os.path.exists(data_filepath)
+    
+    def size_bytes(self) -> int:
+        """Get total size in bytes."""
+        base_dir = os.path.join(self.sstables_dir, self.dirname)
+        total_size = 0
+        if os.path.exists(base_dir):
+            for filename in os.listdir(base_dir):
+                filepath = os.path.join(base_dir, filename)
+                if os.path.isfile(filepath):
+                    total_size += os.path.getsize(filepath)
+        return total_size
+    
+    def close(self):
+        """Close the underlying SSTable if loaded."""
+        with self._load_lock:
+            if self._sstable is not None:
+                self._sstable.close()
+                self._sstable = None
+                self._loaded = False
+    
+    def unload(self):
+        """
+        Unload the SSTable from memory (keeps metadata).
+        
+        Useful for memory management - can reload on next access.
+        """
+        self.close()
+    
+    def delete(self):
+        """Delete the SSTable from disk."""
+        self.close()
+        
+        base_dir = os.path.join(self.sstables_dir, self.dirname)
+        if os.path.exists(base_dir):
+            import shutil
+            shutil.rmtree(base_dir)
+    
+    def is_loaded(self) -> bool:
+        """Check if the SSTable is currently loaded in memory."""
+        return self._loaded
+    
+    @property
+    def access_count(self) -> int:
+        """Get the number of times this SSTable has been accessed."""
+        return self._access_count
+    
+    def __str__(self) -> str:
+        """String representation."""
+        loaded_str = "loaded" if self._loaded else "not loaded"
+        return f"LazySSTable({self.dirname}, {loaded_str}, accesses={self._access_count})"

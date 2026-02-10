@@ -690,15 +690,28 @@ class SSTableManager:
         Only called after new SSTable is persisted to disk.
         Updates in-memory state, manifests, and deletes old SSTables.
         """
+        # Collect old LazySSTable objects to close/delete after releasing lock
+        # Must collect the actual objects to properly close their mmap handles
+        old_sstables_to_delete: List[LazySSTable] = []
+        
         with self.lock:
-            # Remove old SSTables from in-memory levels
+            # Collect and remove old SSTables from source level
             if source_level in self.levels:
+                old_sstables_to_delete.extend([
+                    s for s in self.levels[source_level]
+                    if s.sstable_id in source_ids
+                ])
                 self.levels[source_level] = [
                     s for s in self.levels[source_level]
                     if s.sstable_id not in source_ids
                 ]
             
+            # Collect and remove old SSTables from next level
             if next_level in self.levels:
+                old_sstables_to_delete.extend([
+                    s for s in self.levels[next_level]
+                    if s.sstable_id in next_ids
+                ])
                 self.levels[next_level] = [
                     s for s in self.levels[next_level]
                     if s.sstable_id not in next_ids
@@ -742,10 +755,13 @@ class SSTableManager:
                 self.level_manifest_manager.remove_sstables(list(next_ids), level=next_level)
         
         # Delete old SSTable files (outside lock, just file I/O)
-        for sstable_id in source_ids | next_ids:
-            old_sstable = SSTable(self.sstables_dir, sstable_id)
-            if old_sstable.exists():
+        # Use the actual LazySSTable objects which have the open mmap handles
+        # LazySSTable.delete() calls close() internally before removing files
+        for old_sstable in old_sstables_to_delete:
+            try:
                 old_sstable.delete()
+            except Exception as e:
+                print(f"[Compact-Worker] Warning: Failed to delete {old_sstable.dirname}: {e}")
     
     def _trigger_manifest_reload(self):
         """

@@ -454,11 +454,14 @@ class SSTableManager:
                 if entry.timestamp > key_map[entry.key].timestamp:
                     key_map[entry.key] = entry
 
-        # Only drop tombstones at the bottommost level to prevent resurrection
-        is_bottommost = not any(
-            lvl > next_level and self.levels.get(lvl)
-            for lvl in self.levels
-        )
+        # Only drop tombstones at the bottommost level to prevent resurrection.
+        # Must hold lock: concurrent background compaction could add a lower level
+        # between check and tombstone drop, causing deleted keys to resurrect.
+        with self.lock:
+            is_bottommost = not any(
+                lvl > next_level and self.levels.get(lvl)
+                for lvl in self.levels
+            )
 
         if is_bottommost:
             merged_entries = [e for e in key_map.values() if not e.is_deleted]

@@ -79,6 +79,10 @@ class LSMKVStore:
         # Shutdown flag: rejects new writes during/after close()
         self._closed = False
 
+        # Timestamp generation: wall clock + guard against backward/same-microsecond
+        self._last_timestamp = 0
+        self._timestamp_lock = threading.Lock()
+
         # Load existing data
         self.sstable_manager.load_from_manifest()
         self._recover_from_wal()
@@ -88,7 +92,13 @@ class LSMKVStore:
         """Recover memtables from the WAL on startup."""
         print("Recovering from WAL...")
         records = self.wal.read_all()
-        
+
+        # Seed _last_timestamp so new writes win over recovered data after restore/reboot
+        if records:
+            max_ts = max(r.timestamp for r in records)
+            with self._timestamp_lock:
+                self._last_timestamp = max(self._last_timestamp, max_ts)
+
         for record in records:
             entry = Entry(
                 key=record.key,
@@ -327,9 +337,16 @@ class LSMKVStore:
     
     def _get_timestamp(self) -> int:
         """Get monotonically increasing timestamp in microseconds.
-        Uses time.monotonic_ns() to avoid NTP/clock-going-backward issues.
+        Uses time.time() (wall clock) so timestamps survive reboots and
+        newer-wins semantics work across restarts. Guards against NTP
+        clock going backward and same-microsecond collisions.
         """
-        return time.monotonic_ns() // 1000
+        now = int(time.time() * 1000000)
+        with self._timestamp_lock:
+            if now <= self._last_timestamp:
+                now = self._last_timestamp + 1
+            self._last_timestamp = now
+            return now
     
     def close(self):
         """Clean shutdown of the store. Flushes all pending data before shutdown."""

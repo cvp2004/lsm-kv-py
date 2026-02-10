@@ -93,9 +93,16 @@ class LSMKVStore:
         print("Recovering from WAL...")
         records = self.wal.read_all()
 
-        # Seed _last_timestamp so new writes win over recovered data after restore/reboot
+        # Seed _last_timestamp so new writes win over both WAL and SSTable data.
+        # WAL may be empty after clean shutdown; SSTables retain prior timestamps.
+        # If clock drifted backward between sessions, new writes must still win.
+        max_ts = 0
         if records:
             max_ts = max(r.timestamp for r in records)
+        sstable_entries = self.sstable_manager.get_all_entries()
+        if sstable_entries:
+            max_ts = max(max_ts, max(e.timestamp for e in sstable_entries))
+        if max_ts > 0:
             with self._timestamp_lock:
                 self._last_timestamp = max(self._last_timestamp, max_ts)
 

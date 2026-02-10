@@ -3,7 +3,6 @@ Write-Ahead Log implementation for durability.
 """
 import os
 import threading
-import threading
 from typing import List
 from lsmkv.core.dto import WALRecord, OperationType
 
@@ -11,17 +10,14 @@ from lsmkv.core.dto import WALRecord, OperationType
 class WAL:
     """Write-Ahead Log for ensuring durability of operations."""
 
-
     def __init__(self, filepath: str):
         """
         Initialize the WAL.
-
 
         Args:
             filepath: Path to the WAL file
         """
         self.filepath = filepath
-        self._lock = threading.Lock()
         self._lock = threading.Lock()
         self._ensure_file_exists()
     
@@ -45,32 +41,13 @@ class WAL:
                 f.flush()
                 os.fsync(f.fileno())
 
-        with self._lock:
-            with open(self.filepath, 'a') as f:
-                f.write(record.serialize())
-                f.flush()
-                os.fsync(f.fileno())
-
     def read_all(self) -> List[WALRecord]:
         """
         Read all records from the WAL.
 
-
         Returns:
             List of WAL records
         """
-        with self._lock:
-            records = []
-            with open(self.filepath, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            records.append(WALRecord.deserialize(line))
-                        except ValueError as e:
-                            print(f"Warning: Skipping corrupted WAL record: {e}")
-            return records
-
         with self._lock:
             records = []
             with open(self.filepath, 'r') as f:
@@ -119,9 +96,6 @@ class WAL:
 
     def delete(self):
         """Delete the WAL file."""
-        with self._lock:
-            if os.path.exists(self.filepath):
-                os.remove(self.filepath)
         with self._lock:
             if os.path.exists(self.filepath):
                 os.remove(self.filepath)
